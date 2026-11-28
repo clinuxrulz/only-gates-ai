@@ -327,13 +327,26 @@ def build_denoise_input(bits, level, labels):
     return torch.cat([images, levels, onehot], dim=1)
 
 
-def corrupt(bits, generator, device):
-    """Flip each pixel with probability ``level``; returns (noisy, levels)."""
-    level = torch.rand(len(bits), generator=generator, device=device)
-    flip = (
-        torch.rand(bits.shape, generator=generator, device=device) < level.unsqueeze(1)
+def replace_noise(bits, level, generator=None):
+    """Replace each pixel with a uniform random bit with probability ``level``.
+
+    Replacement rather than flipping matters. With XOR corruption, ``1 - noisy``
+    is the true digit for (1 - level) of the pixels, so a model can learn the
+    trivial inverse whenever the level is high. That is exactly the shortcut the
+    first denoiser took: IoU 84% at level 0.9 but 0% at 0.5.
+    """
+    device = bits.device
+    take = torch.rand(bits.shape, generator=generator, device=device) < level
+    random_bits = (
+        torch.rand(bits.shape, generator=generator, device=device) < 0.5
     ).float()
-    return torch.abs(bits - flip), level
+    return torch.where(take, random_bits, bits)
+
+
+def corrupt(bits, generator, device):
+    """Corrupt at a random level; returns (noisy, levels)."""
+    level = torch.rand(len(bits), generator=generator, device=device)
+    return replace_noise(bits, level.unsqueeze(1), generator), level
 
 
 # ---------------------------------------------------------------------------
@@ -464,12 +477,7 @@ def denoise_metrics(models, test_x, test_y, args, device, levels=(0.2, 0.5, 0.7,
                 bits = test_x[start : start + args.batch]
                 labels = test_y[start : start + args.batch]
                 level = torch.full((len(bits),), level_value, device=device)
-                flip = (
-                    torch.rand(
-                        bits.shape, generator=generator, device=device
-                    ) < level_value
-                ).float()
-                noisy = torch.abs(bits - flip)
+                noisy = replace_noise(bits, level_value, generator)
                 probability = torch.zeros(len(bits), PIXELS, device=device)
                 for model in models:
                     probability += model(
@@ -571,8 +579,7 @@ def sample_denoise(models, args, device, labels, steps=None):
         clean = (torch.rand(count, PIXELS, device=device) < probability).float()
         next_level = max(0.0, 1.0 - (step + 1) / steps)
         if next_level > 0:
-            noise = (torch.rand(count, PIXELS, device=device) < next_level).float()
-            bits = torch.abs(clean - noise)
+            bits = replace_noise(clean, next_level)
         else:
             bits = clean
     return bits
