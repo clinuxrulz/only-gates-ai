@@ -179,14 +179,15 @@ class GateConv4(nn.Module):
 class GateConvGen(nn.Module):
     """Fully convolutional generator at full 28x28 resolution.
 
-    Input channels are (masked image, mask, ten broadcast class bits), so the
-    class conditions every position without breaking translation equivariance.
+    Input channels are (masked image, mask, ten broadcast class bits), plus an
+    optional self-conditioning channel holding the previous estimate. The class
+    conditions every position without breaking translation equivariance.
     """
 
-    def __init__(self, channels, layers, votes, generator):
+    def __init__(self, channels, layers, votes, generator, extra_channels=0):
         super().__init__()
         self.layers = nn.ModuleList()
-        previous = 2 + CLASSES
+        previous = 2 + CLASSES + extra_channels
         for _ in range(max(1, layers - 1)):
             self.layers.append(GateConv4(previous, channels, generator))
             previous = channels
@@ -314,8 +315,13 @@ def model_input(args, bits, mask, labels):
     return build_input(bits, mask, labels)
 
 
-def build_denoise_input(bits, level, labels):
-    """Input for the denoising task: (noisy pixels, corruption level, class)."""
+def build_denoise_input(bits, level, labels, previous=None):
+    """Input for the denoising task: (noisy pixels, level, class, self-condition).
+
+    ``previous`` is the model's own last estimate, so later steps refine rather
+    than restart. That is what lets a small model sharpen the class mean into a
+    particular digit instead of re-predicting the mean every step.
+    """
     images = bits.view(-1, 1, 28, 28)
     levels = level.view(-1, 1, 1, 1).expand(-1, 1, 28, 28)
     onehot = (
@@ -324,7 +330,16 @@ def build_denoise_input(bits, level, labels):
         .view(-1, CLASSES, 1, 1)
         .expand(-1, -1, 28, 28)
     )
-    return torch.cat([images, levels, onehot], dim=1)
+    if previous is None:
+        previous = torch.zeros(len(bits), 1, 28, 28, device=bits.device)
+    else:
+        previous = previous.view(-1, 1, 28, 28)
+    return torch.cat([images, levels, onehot, previous], dim=1)
+
+
+def denoise_forward(model, noisy, level, labels, previous, votes, batch=None):
+    out = model(build_denoise_input(noisy, level, labels, previous))
+    return out.reshape(len(noisy), -1, votes).mean(dim=2)
 
 
 def replace_noise(bits, level, generator=None):
@@ -436,9 +451,15 @@ def train_denoise(model, train_x, train_y, args, device, seed):
             bits = train_x[indices]
             labels = train_y[indices]
             noisy, level = corrupt(bits, generator, device)
-            probability = model(build_denoise_input(noisy, level, labels))
-            probability = probability.reshape(len(indices), -1, args.gen_k).mean(
-                dim=2
+            previous = None
+            if args.self_condition and torch.rand(1).item() < 0.5:
+                # Half the time, condition on the model's own first guess.
+                with torch.no_grad():
+                    previous = denoise_forward(
+                        model, noisy, level, labels, None, args.gen_k
+                    )
+            probability = denoise_forward(
+                model, noisy, level, labels, previous, args.gen_k
             )
             weight = 1.0 + (args.ink_weight - 1.0) * bits
             loss = (
@@ -480,9 +501,9 @@ def denoise_metrics(models, test_x, test_y, args, device, levels=(0.2, 0.5, 0.7,
                 noisy = replace_noise(bits, level_value, generator)
                 probability = torch.zeros(len(bits), PIXELS, device=device)
                 for model in models:
-                    probability += model(
-                        build_denoise_input(noisy, level, labels)
-                    ).reshape(len(bits), -1, args.gen_k).mean(dim=2)
+                    probability += denoise_forward(
+                        model, noisy, level, labels, None, args.gen_k
+                    )
                 probability /= len(models)
                 prediction = (probability > 0.5).float()
                 ink += bits.sum().item()
@@ -565,16 +586,18 @@ def sample_denoise(models, args, device, labels, steps=None):
         model.eval()
     count = len(labels)
     bits = (torch.rand(count, PIXELS, device=device) < 0.5).float()
+    previous = None
     for step in range(steps):
         level = 1.0 - step / steps
         levels = torch.full((count,), level, device=device)
         probability = torch.zeros(count, PIXELS, device=device)
         with torch.no_grad():
             for model in models:
-                probability += model(
-                    build_denoise_input(bits, levels, labels)
-                ).reshape(count, -1, args.gen_k).mean(dim=2)
+                probability += denoise_forward(
+                    model, bits, levels, labels, previous, args.gen_k
+                )
         probability /= len(models)
+        previous = probability if args.self_condition else None
         # Sample, never threshold: a marginal of 0.19 must still produce ink.
         clean = (torch.rand(count, PIXELS, device=device) < probability).float()
         next_level = max(0.0, 1.0 - (step + 1) / steps)
@@ -808,6 +831,11 @@ def parse():
     )
     parser.add_argument("--conv-channels", type=int, default=8)
     parser.add_argument("--conv-layers", type=int, default=4)
+    parser.add_argument(
+        "--self-condition",
+        action="store_true",
+        help="Feed the previous estimate back as an input channel.",
+    )
     parser.add_argument("--gen-k", type=int, default=4)
     parser.add_argument("--keep-min", type=float, default=0.0)
     parser.add_argument("--keep-max", type=float, default=1.0)
@@ -876,7 +904,11 @@ def main():
         generator.manual_seed(seed)
         if args.arch == "conv":
             model = GateConvGen(
-                args.conv_channels, args.conv_layers, args.gen_k, generator
+                args.conv_channels,
+                args.conv_layers,
+                args.gen_k,
+                generator,
+                extra_channels=1 if args.task == "denoise" else 0,
             ).to(device)
             cells = sum(layer.filters * PIXELS for layer in model.layers)
         else:
