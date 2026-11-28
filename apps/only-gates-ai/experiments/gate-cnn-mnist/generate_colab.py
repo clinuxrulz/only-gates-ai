@@ -108,9 +108,114 @@ class GateNet4(nn.Module):
         return value
 
 
+class GateConv4(nn.Module):
+    """Three-by-three cell with a shared four-pin LUT.
+
+    Wires and the 16-bit table are shared across every spatial position, which
+    is the inductive bias the dense forest lacks: neighbouring output pixels
+    then use the same detector, so strokes can be continuous.
+    """
+
+    def __init__(self, in_channels, filters, generator, kernel=3):
+        super().__init__()
+        self.in_channels = in_channels
+        self.filters = filters
+        self.kernel = kernel
+        self.padding = kernel // 2
+        fan_in = kernel * kernel * in_channels
+        for name in WIRE_NAMES:
+            setattr(self, name, random_logits([filters, fan_in], generator))
+        self.table = nn.Parameter(
+            torch.randn(filters, 16, generator=generator) * 0.5
+        )
+        self.temperature = 1.0
+        self.pins = ()
+
+    def _output_shape(self, x):
+        height = (x.shape[2] + 2 * self.padding - self.kernel) + 1
+        width = (x.shape[3] + 2 * self.padding - self.kernel) + 1
+        return height, width
+
+    def forward(self, x):
+        patches = F.unfold(x, self.kernel, padding=self.padding)
+        wires = [
+            F.softmax(getattr(self, name) / self.temperature, dim=1)
+            for name in WIRE_NAMES
+        ]
+        values = [torch.einsum("bfl,cf->blc", patches, wire) for wire in wires]
+        weights = [torch.stack([1.0 - value, value], dim=-1) for value in values]
+        weight = (
+            weights[0].unsqueeze(4).unsqueeze(5).unsqueeze(6)
+            * weights[1].unsqueeze(3).unsqueeze(5).unsqueeze(6)
+            * weights[2].unsqueeze(3).unsqueeze(4).unsqueeze(6)
+            * weights[3].unsqueeze(3).unsqueeze(4).unsqueeze(5)
+        )
+        table = torch.sigmoid(self.table / self.temperature).view(
+            self.filters, 2, 2, 2, 2
+        )
+        result = (weight * table.unsqueeze(0).unsqueeze(0)).sum(
+            dim=(3, 4, 5, 6)
+        )
+        height, width = self._output_shape(x)
+        return result.permute(0, 2, 1).reshape(
+            x.shape[0], self.filters, height, width
+        )
+
+    def hard_forward(self, x):
+        patches = F.unfold(x.float(), self.kernel, padding=self.padding)
+        pins = [
+            patches[:, getattr(self, name).argmax(dim=1), :] for name in WIRE_NAMES
+        ]
+        index = sum(
+            pin * (8 >> position) for position, pin in enumerate(pins)
+        ).long()
+        bits = (self.table > 0).float()
+        table = bits.unsqueeze(0).expand(x.shape[0], -1, -1)
+        result = torch.gather(table, 2, index)
+        height, width = self._output_shape(x)
+        return result.reshape(x.shape[0], self.filters, height, width)
+
+
+class GateConvGen(nn.Module):
+    """Fully convolutional generator at full 28x28 resolution.
+
+    Input channels are (masked image, mask, ten broadcast class bits), so the
+    class conditions every position without breaking translation equivariance.
+    """
+
+    def __init__(self, channels, layers, votes, generator):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        previous = 2 + CLASSES
+        for _ in range(max(1, layers - 1)):
+            self.layers.append(GateConv4(previous, channels, generator))
+            previous = channels
+        self.layers.append(GateConv4(previous, votes, generator))
+        self.output_size = PIXELS * votes
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x.permute(0, 2, 3, 1).reshape(x.shape[0], -1)
+
+    def hard_forward(self, x):
+        for layer in self.layers:
+            x = layer.hard_forward(x)
+        return x.permute(0, 2, 3, 1).reshape(x.shape[0], -1)
+
+
+
 # ---------------------------------------------------------------------------
 # Wire pinning
 # ---------------------------------------------------------------------------
+
+
+def _wire_shape(module):
+    if isinstance(module, GateConv4):
+        return module.filters, module.kernel * module.kernel * module.in_channels
+    if isinstance(module, GateDense4):
+        return module.out_features, module.in_features
+    return None
 
 
 def pin_wires(model, generator, fraction):
@@ -122,19 +227,19 @@ def pin_wires(model, generator, fraction):
     guarantees every input bit reaches at least one pinned wire.
     """
     for module in model.modules():
-        if not isinstance(module, GateDense4):
+        shape = _wire_shape(module)
+        if shape is None:
             continue
-        keep = int(round(module.out_features * fraction))
+        count, fan_in = shape
+        keep = int(round(count * fraction))
         if keep <= 0:
             continue
         pool = []
         while len(pool) < len(WIRE_NAMES) * keep:
-            pool.extend(
-                torch.randperm(module.in_features, generator=generator).tolist()
-            )
+            pool.extend(torch.randperm(fan_in, generator=generator).tolist())
         pins = []
         for index, name in enumerate(WIRE_NAMES):
-            rows = torch.randperm(module.out_features, generator=generator)[:keep]
+            rows = torch.randperm(count, generator=generator)[:keep]
             slots = torch.tensor(
                 pool[index * keep : (index + 1) * keep], device=module.table.device
             )
@@ -149,9 +254,7 @@ def pin_wires(model, generator, fraction):
 def reimpose_pinned(model):
     """Restore pinned wire rows after an optimiser step."""
     for module in model.modules():
-        if not isinstance(module, GateDense4):
-            continue
-        for name, (rows, slots) in zip(WIRE_NAMES, module.pins):
+        for name, (rows, slots) in zip(WIRE_NAMES, getattr(module, "pins", ())):
             with torch.no_grad():
                 parameter = getattr(module, name)
                 parameter[rows] = 0.0
@@ -160,7 +263,7 @@ def reimpose_pinned(model):
 
 def set_temperature(model, value):
     for module in model.modules():
-        if isinstance(module, GateDense4):
+        if isinstance(module, (GateDense4, GateConv4)):
             module.temperature = value
 
 
@@ -193,6 +296,24 @@ def build_input(bits, mask, labels):
     return torch.cat([bits * mask, mask, onehot], dim=1)
 
 
+def build_conv_input(bits, mask, labels):
+    images = (bits * mask).view(-1, 1, 28, 28)
+    masks = mask.view(-1, 1, 28, 28)
+    onehot = (
+        F.one_hot(labels, CLASSES)
+        .float()
+        .view(-1, CLASSES, 1, 1)
+        .expand(-1, -1, 28, 28)
+    )
+    return torch.cat([images, masks, onehot], dim=1)
+
+
+def model_input(args, bits, mask, labels):
+    if args.arch == "conv":
+        return build_conv_input(bits, mask, labels)
+    return build_input(bits, mask, labels)
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -221,7 +342,7 @@ def train(model, train_x, train_y, args, device, seed):
             mask = (
                 torch.rand(bits.shape, generator=generator, device=device) < keep
             ).float()
-            probability = model(build_input(bits, mask, labels))
+            probability = model(model_input(args, bits, mask, labels))
             probability = probability.reshape(len(indices), -1, args.gen_k).mean(
                 dim=2
             )
@@ -273,7 +394,7 @@ def sample(models, args, device, labels, rounds=None):
     mask = torch.zeros_like(bits)
     for step in range(1, rounds + 1):
         share = (step / rounds) ** args.reveal_power
-        features = build_input(bits, mask, labels)
+        features = model_input(args, bits, mask, labels)
         probability = torch.zeros(count, PIXELS, device=device)
         with torch.no_grad():
             for model in models:
@@ -335,7 +456,7 @@ def completion_metrics(models, test_x, test_y, args, device, keep=0.5):
             mask = (
                 torch.rand(bits.shape, generator=generator, device=device) < keep
             ).float()
-            features = build_input(bits, mask, labels)
+            features = model_input(args, bits, mask, labels)
             probability = torch.zeros(len(bits), PIXELS, device=device)
             for model in models:
                 if args.hard:
@@ -435,6 +556,8 @@ def show(bits, label=None):
 
 
 def export_hard(model, gen_k):
+    if isinstance(model, GateConvGen):
+        return export_conv(model, gen_k)
     layers = []
     for layer in model.layers:
         wires = (
@@ -463,6 +586,46 @@ def export_hard(model, gen_k):
     }
 
 
+def export_conv(model, votes):
+    """Export a shared-rule conv generator.
+
+    Wire indices address the unfolded 3x3 patch as ``channel * 9 + row * 3 +
+    col``, matching ``torch.nn.functional.unfold`` with padding 1. The same
+    four wires and 16-bit table apply at every spatial position.
+    """
+    layers = []
+    for layer in model.layers:
+        wires = (
+            torch.stack(
+                [getattr(layer, name).argmax(dim=1) for name in WIRE_NAMES], dim=1
+            )
+            .flatten()
+            .tolist()
+        )
+        bits = (layer.table > 0).long()
+        tables = [
+            sum(int(bits[row, index].item()) << index for index in range(16))
+            for row in range(bits.shape[0])
+        ]
+        layers.append(
+            {
+                "filters": layer.filters,
+                "inChannels": layer.in_channels,
+                "wires": wires,
+                "tables": tables,
+            }
+        )
+    return {
+        "kind": "lut4-conv-generator",
+        "inputSize": 2 * PIXELS + CLASSES,
+        "imageSize": PIXELS,
+        "outputs": PIXELS,
+        "circuitsPerLabel": votes,
+        "layers": layers,
+    }
+
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -478,6 +641,9 @@ def parse():
     parser.add_argument("--t-start", type=float, default=1.0)
     parser.add_argument("--t-min", type=float, default=0.4)
     parser.add_argument("--dense-hidden", default="512,512,512,512")
+    parser.add_argument("--arch", choices=("dense", "conv"), default="dense")
+    parser.add_argument("--conv-channels", type=int, default=8)
+    parser.add_argument("--conv-layers", type=int, default=4)
     parser.add_argument("--gen-k", type=int, default=4)
     parser.add_argument("--keep-min", type=float, default=0.0)
     parser.add_argument("--keep-max", type=float, default=1.0)
@@ -544,12 +710,18 @@ def main():
         torch.manual_seed(seed)
         generator = torch.Generator()
         generator.manual_seed(seed)
-        model = GateNet4(
-            input_size, hidden, PIXELS * args.gen_k, generator
-        ).to(device)
+        if args.arch == "conv":
+            model = GateConvGen(
+                args.conv_channels, args.conv_layers, args.gen_k, generator
+            ).to(device)
+            cells = sum(layer.filters * PIXELS for layer in model.layers)
+        else:
+            model = GateNet4(
+                input_size, hidden, PIXELS * args.gen_k, generator
+            ).to(device)
+            cells = sum(layer.out_features for layer in model.layers)
         pin_wires(model, generator, args.pin_fraction)
         parameters = sum(parameter.numel() for parameter in model.parameters())
-        cells = sum(layer.out_features for layer in model.layers)
         print(
             f"=== seed {seed} params {parameters:,} cells {cells:,} ===",
             flush=True,
