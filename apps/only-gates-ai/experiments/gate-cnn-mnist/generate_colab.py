@@ -314,6 +314,28 @@ def model_input(args, bits, mask, labels):
     return build_input(bits, mask, labels)
 
 
+def build_denoise_input(bits, level, labels):
+    """Input for the denoising task: (noisy pixels, corruption level, class)."""
+    images = bits.view(-1, 1, 28, 28)
+    levels = level.view(-1, 1, 1, 1).expand(-1, 1, 28, 28)
+    onehot = (
+        F.one_hot(labels, CLASSES)
+        .float()
+        .view(-1, CLASSES, 1, 1)
+        .expand(-1, -1, 28, 28)
+    )
+    return torch.cat([images, levels, onehot], dim=1)
+
+
+def corrupt(bits, generator, device):
+    """Flip each pixel with probability ``level``; returns (noisy, levels)."""
+    level = torch.rand(len(bits), generator=generator, device=device)
+    flip = (
+        torch.rand(bits.shape, generator=generator, device=device) < level.unsqueeze(1)
+    ).float()
+    return torch.abs(bits - flip), level
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -369,6 +391,101 @@ def train(model, train_x, train_y, args, device, seed):
             f"loss {loss_sum / max(1, batches):.4f} {time.time() - started:6.1f}s",
             flush=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Denoising task
+# ---------------------------------------------------------------------------
+
+
+def train_denoise(model, train_x, train_y, args, device, seed):
+    """Learn p(clean | noisy, level, class) by flipping pixels at random rates.
+
+    Unlike masked completion, the corruption level is an input, so the model
+    can express "I am mostly guessing" and is never asked to threshold its own
+    marginal. That is what lets sampling start from pure noise.
+    """
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    total = len(train_x)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    started = time.time()
+    for epoch in range(1, args.epochs + 1):
+        ratio = (epoch - 1) / max(1, args.epochs - 1)
+        temperature = args.t_start * (args.t_min / args.t_start) ** ratio
+        set_temperature(model, temperature)
+        model.train()
+        permutation = torch.randperm(total, device=device)
+        loss_sum = 0.0
+        batches = 0
+        for start in range(0, total, args.batch):
+            indices = permutation[start : start + args.batch]
+            bits = train_x[indices]
+            labels = train_y[indices]
+            noisy, level = corrupt(bits, generator, device)
+            probability = model(build_denoise_input(noisy, level, labels))
+            probability = probability.reshape(len(indices), -1, args.gen_k).mean(
+                dim=2
+            )
+            weight = 1.0 + (args.ink_weight - 1.0) * bits
+            loss = (
+                F.binary_cross_entropy(
+                    probability.clamp(1e-4, 1.0 - 1e-4), bits, reduction="none"
+                )
+                * weight
+            ).sum() / weight.sum().clamp_min(1.0)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            reimpose_pinned(model)
+            loss_sum += loss.item()
+            batches += 1
+        print(
+            f"  epoch {epoch:2d}/{args.epochs} T {temperature:.2f} "
+            f"loss {loss_sum / max(1, batches):.4f} {time.time() - started:6.1f}s",
+            flush=True,
+        )
+
+
+def denoise_metrics(models, test_x, test_y, args, device, levels=(0.2, 0.5, 0.7, 0.9)):
+    """Recovery quality at several corruption levels."""
+    generator = torch.Generator(device=device)
+    generator.manual_seed(args.seed + 2)
+    for model in models:
+        model.eval()
+    results = {}
+    with torch.no_grad():
+        for level_value in levels:
+            ink = 0.0
+            hits = 0.0
+            predicted = 0.0
+            for start in range(0, len(test_x), args.batch):
+                bits = test_x[start : start + args.batch]
+                labels = test_y[start : start + args.batch]
+                level = torch.full((len(bits),), level_value, device=device)
+                flip = (
+                    torch.rand(
+                        bits.shape, generator=generator, device=device
+                    ) < level_value
+                ).float()
+                noisy = torch.abs(bits - flip)
+                probability = torch.zeros(len(bits), PIXELS, device=device)
+                for model in models:
+                    probability += model(
+                        build_denoise_input(noisy, level, labels)
+                    ).reshape(len(bits), -1, args.gen_k).mean(dim=2)
+                probability /= len(models)
+                prediction = (probability > 0.5).float()
+                ink += bits.sum().item()
+                hits += (prediction * bits).sum().item()
+                predicted += prediction.sum().item()
+            results[level_value] = {
+                "inkRecall": hits / max(1.0, ink),
+                "inkPrecision": hits / max(1.0, predicted),
+                "inkIou": hits / max(1.0, ink + predicted - hits),
+            }
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +548,40 @@ def sample(models, args, device, labels, rounds=None):
         bits = torch.where(selected, pixels, bits)
         mask = torch.where(selected, torch.ones_like(mask), mask)
     return bits
+
+
+def sample_denoise(models, args, device, labels, steps=None):
+    """Ancestral sampling: start from noise, denoise, re-noise at a lower level."""
+    steps = steps or args.rounds
+    for model in models:
+        model.eval()
+    count = len(labels)
+    bits = (torch.rand(count, PIXELS, device=device) < 0.5).float()
+    for step in range(steps):
+        level = 1.0 - step / steps
+        levels = torch.full((count,), level, device=device)
+        probability = torch.zeros(count, PIXELS, device=device)
+        with torch.no_grad():
+            for model in models:
+                probability += model(
+                    build_denoise_input(bits, levels, labels)
+                ).reshape(count, -1, args.gen_k).mean(dim=2)
+        probability /= len(models)
+        # Sample, never threshold: a marginal of 0.19 must still produce ink.
+        clean = (torch.rand(count, PIXELS, device=device) < probability).float()
+        next_level = max(0.0, 1.0 - (step + 1) / steps)
+        if next_level > 0:
+            noise = (torch.rand(count, PIXELS, device=device) < next_level).float()
+            bits = torch.abs(clean - noise)
+        else:
+            bits = clean
+    return bits
+
+
+def generate(models, args, device, labels):
+    if args.task == "denoise":
+        return sample_denoise(models, args, device, labels)
+    return sample(models, args, device, labels)
 
 
 def completion_metrics(models, test_x, test_y, args, device, keep=0.5):
@@ -642,6 +793,12 @@ def parse():
     parser.add_argument("--t-min", type=float, default=0.4)
     parser.add_argument("--dense-hidden", default="512,512,512,512")
     parser.add_argument("--arch", choices=("dense", "conv"), default="dense")
+    parser.add_argument(
+        "--task",
+        choices=("complete", "denoise"),
+        default="complete",
+        help="complete: masked completion. denoise: recover flipped pixels.",
+    )
     parser.add_argument("--conv-channels", type=int, default=8)
     parser.add_argument("--conv-layers", type=int, default=4)
     parser.add_argument("--gen-k", type=int, default=4)
@@ -726,24 +883,38 @@ def main():
             f"=== seed {seed} params {parameters:,} cells {cells:,} ===",
             flush=True,
         )
-        train(model, train_x, train_y, args, device, seed)
+        if args.task == "denoise":
+            train_denoise(model, train_x, train_y, args, device, seed)
+        else:
+            train(model, train_x, train_y, args, device, seed)
         models.append(model)
 
     # Cumulative curve, the same shape used for the classifier forest.
     curve = []
-    for count in range(1, len(models) + 1):
-        metrics = completion_metrics(models[:count], test_x, test_y, args, device)
-        print(
-            f"forest of {count} "
-            + " ".join(
-                f"{name} {value * 100:.2f}%" for name, value in metrics.items()
-            ),
-            flush=True,
-        )
-        curve.append(metrics)
+    if args.task == "denoise":
+        denoise = denoise_metrics(models, test_x, test_y, args, device)
+        for level, value in denoise.items():
+            print(
+                f"denoise level {level:4.2f} "
+                + " ".join(
+                    f"{name} {score * 100:.2f}%" for name, score in value.items()
+                ),
+                flush=True,
+            )
+    else:
+        for count in range(1, len(models) + 1):
+            metrics = completion_metrics(models[:count], test_x, test_y, args, device)
+            print(
+                f"forest of {count} "
+                + " ".join(
+                    f"{name} {value * 100:.2f}%" for name, value in metrics.items()
+                ),
+                flush=True,
+            )
+            curve.append(metrics)
 
     hard_metrics = None
-    if not args.hard:
+    if not args.hard and args.task == "complete":
         args.hard = True
         hard_metrics = completion_metrics(models, test_x, test_y, args, device)
         print(
@@ -758,11 +929,11 @@ def main():
     labels = torch.arange(CLASSES, device=device).repeat_interleave(
         max(1, args.samples // CLASSES)
     )
-    samples = sample(models, args, device, labels)
+    samples = generate(models, args, device, labels)
     for index in range(min(len(labels), args.samples)):
         show(samples[index], int(labels[index]))
 
-    if args.context_curve:
+    if args.context_curve and args.task == "complete":
         # Does more visible context help? If IoU is flat here, the model is
         # painting per-pixel marginals and ignoring the canvas.
         for keep in (0.0, 0.25, 0.5, 0.75):
@@ -785,7 +956,7 @@ def main():
             max(1, args.eval_samples // CLASSES)
         )
         for count in range(1, len(models) + 1):
-            eval_samples = sample(models[:count], args, device, eval_labels)
+            eval_samples = generate(models[:count], args, device, eval_labels)
             score = judge_agreement(judge, eval_samples, eval_labels, device)
             print(
                 f"judge agreement forest of {count} "
